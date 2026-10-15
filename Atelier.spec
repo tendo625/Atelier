@@ -1,6 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 from pathlib import Path
+import os
 import sys
 
 # One list, shared with the dist audit in scripts/stage_tools.py.
@@ -84,6 +85,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon='icon.ico',
+    version=os.environ.get('ATELIER_PE_VERSION_FILE'),
 )
 
 coll = COLLECT(

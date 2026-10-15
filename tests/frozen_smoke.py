@@ -35,8 +35,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--exe', type=Path, required=True)
     parser.add_argument('--report-dir', type=Path, required=True)
-    parser.add_argument('--debug-port', type=int, default=9338)
-    parser.add_argument('--app-port', type=int, default=8778)
+    parser.add_argument('--debug-port', type=int, default=0, help='0 selects an available port')
+    parser.add_argument('--app-port', type=int, default=0, help='0 selects an available port')
+    parser.add_argument('--first-run', action='store_true', help='Check actual initial setup without creating config or project fixtures')
     args = parser.parse_args()
     if os.name != 'nt':
         raise SystemExit('The frozen desktop smoke requires Windows.')
@@ -45,16 +46,25 @@ def main():
     report.mkdir(parents=True, exist_ok=True)
     data = report / 'isolated-data'
     data.mkdir(exist_ok=False)
-    for port in (args.app_port, args.debug_port):
-        with socket.socket() as sock:
-            if sock.connect_ex(('127.0.0.1', port)) == 0:
-                raise SystemExit(f'Port {port} is in use; no running application was stopped.')
-    project = data / 'assets' / 'projects' / 'Frozen smoke'
-    project.mkdir(parents=True)
-    (data / 'mr_config.json').write_text(json.dumps({
-        'paks': str(data / 'no-game-paks'), 'tools': str(data / 'Tools'),
-        'active_project': 'Frozen smoke', 'mods_folder': str(data / 'test-mods'),
-    }), encoding='utf-8')
+    reserved = []
+    try:
+        for attribute in ('app_port', 'debug_port'):
+            sock = socket.socket()
+            reserved.append(sock)
+            sock.bind(('127.0.0.1', getattr(args, attribute)))
+            setattr(args, attribute, sock.getsockname()[1])
+    except OSError as error:
+        raise SystemExit(f'Test port is unavailable: {error}; no running application was stopped.')
+    finally:
+        for sock in reserved:
+            sock.close()
+    if not args.first_run:
+        project = data / 'assets' / 'projects' / 'Frozen smoke'
+        project.mkdir(parents=True)
+        (data / 'mr_config.json').write_text(json.dumps({
+            'paks': str(data / 'no-game-paks'), 'tools': str(data / 'Tools'),
+            'active_project': 'Frozen smoke', 'mods_folder': str(data / 'test-mods'),
+        }), encoding='utf-8')
     env = os.environ.copy()
     env['ATELIER_DATA_DIR'] = str(data)
     env['ATELIER_PORT'] = str(args.app_port)
@@ -80,16 +90,31 @@ def main():
     hider = threading.Thread(target=hide_loop, daemon=True)
     hider.start()
     result = {'exe_sha256': hashlib.sha256(exe.read_bytes()).hexdigest(),
-              'checks': [], 'page_errors': [], 'fixture_scope': 'Game browsing and remote checks only'}
+              'checks': [], 'page_errors': [], 'ports': {'app': args.app_port, 'debug': args.debug_port},
+              'fixture_scope': 'Game browsing and remote checks only'}
     try:
         wait_port(args.app_port, process)
         wait_port(args.debug_port, process)
-        from playwright.sync_api import sync_playwright
+        from playwright.sync_api import sync_playwright, TimeoutError as CaptureTimeout
         with sync_playwright() as pw:
             browser = pw.chromium.connect_over_cdp(f'http://127.0.0.1:{args.debug_port}')
             context = browser.contexts[0]
             page = context.pages[0]
             page.on('pageerror', lambda error: result['page_errors'].append(str(error)))
+            if args.first_run:
+                context.route('https://**', lambda route: route.fulfill(json={}))
+                context.route('**/api/update_check', lambda route: route.fulfill(json={'available': False}))
+                page.reload()
+                page.wait_for_function("document.querySelector('#setup-overlay')?.classList.contains('active')")
+                with urllib.request.urlopen(f'http://127.0.0.1:{args.app_port}/api/setup_status') as response:
+                    assert json.load(response)['configured'] is False
+                # Setup may display auto-detected game paths or a fetched AES value.
+                # Record assertions only; do not put a first-run screenshot in release logs.
+                assert not result['page_errors'], result['page_errors']
+                result['checks'].append('Clean first launch opens real Setup without development configuration, game files or native tools')
+                print('PASS ' + result['checks'][-1])
+                browser.close()
+                return
             fixture_items = [dict(type='folder', name=n, label=n, rel_path=n, count=3)
                              for n in ('Characters', 'Textures', 'Materials', 'Weapons', 'Audio', 'Maps')]
             fixtures = {
@@ -111,6 +136,10 @@ def main():
             page.wait_for_function("window.AtelierViewport && window.atelierProject?.() === 'Frozen smoke'")
             page.wait_for_function("document.querySelectorAll('#grid-area .card').length === 6")
             page.wait_for_function("!document.querySelector('.overlay.active')")
+            # The grid and sidebar load independently. Require sidebar readiness rather than
+            # sampling it immediately after the six browse cards appear.
+            page.wait_for_function("document.querySelector('[data-atelier-motion=\"empty-assets\"]')?.getBoundingClientRect().width === 112")
+            page.evaluate("() => document.fonts.ready")
             result['renderer'] = page.evaluate('navigator.userAgent')
             result['checks'].append('Actual frozen executable serves the interface in native WebView2')
             info = page.evaluate("""() => ({
@@ -131,10 +160,24 @@ def main():
             assert info['logo'] > 0 and info['emptyTray'] == 112 and info['singleMark'] == 1, info
             result['interface'] = info
             result['checks'].append('All workflow modules, six motion sets, local font and logo load from the frozen bundle')
+            theme_colors = {}
             for theme in ('light', 'dark'):
                 page.locator('#topbar [data-theme-picker]').select_option(theme)
                 assert page.evaluate('document.documentElement.dataset.theme') == theme
-                page.screenshot(path=str(report / f'frozen-{theme}.png'))
+                if theme == 'dark':
+                    page.wait_for_function('(previous) => getComputedStyle(document.body).backgroundColor !== previous',
+                                           arg=theme_colors['light'], polling=100)
+                theme_colors[theme] = page.evaluate('getComputedStyle(document.body).backgroundColor')
+                try:
+                    page.screenshot(path=str(report / f'frozen-{theme}.png'), animations='disabled', timeout=5000)
+                except CaptureTimeout:
+                    # A hidden WebView2 compositor can stall PNG capture while its DOM and
+                    # backend remain responsive. Images are diagnostics; assertions still gate.
+                    warning = f'{theme} PNG capture timed out in the hidden native shell'
+                    result.setdefault('screenshot_warnings', []).append(warning)
+                    print('DIAGNOSTIC ' + warning)
+            assert theme_colors['light'] != theme_colors['dark'], theme_colors
+            result['theme_colors'] = theme_colors
             result['checks'].append('Light and dark themes render in the native shell')
             # Confirm the real frozen backend registered the new endpoint, without native tools.
             try:
@@ -146,6 +189,13 @@ def main():
                 raise AssertionError('Invalid material path was not rejected with HTTP 400')
             assert rejected.get('ok') is False and rejected.get('error'), rejected
             result['checks'].append('Frozen Python backend includes original-material comparison and rejects traversal')
+            # This request goes directly to the frozen backend, outside the UI's HTTP fixtures.
+            with urllib.request.urlopen(f'http://127.0.0.1:{args.app_port}/api/prereqs') as response:
+                prerequisites = json.load(response)
+            messages = '\n'.join(issue['message'] for issue in prerequisites['issues'])
+            for tool in ('UAssetTool.exe', 'retoc-rivals-cli.exe', 'oo2core_9_win64.dll'):
+                assert tool in messages, (tool, prerequisites)
+            result['checks'].append('Missing external UAssetTool, custom retoc and Oodle produce actionable prerequisite messages')
             assert not result['page_errors'], result['page_errors']
             browser.close()
     except Exception as exc:

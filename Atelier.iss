@@ -1,26 +1,45 @@
-#define AppName "Atelier"
+; Build through BUILD.bat / scripts/package_release.py. PayloadInclude is an audited file list.
 #ifndef AppVersion
-  #define AppVersion "0.0.3"
+  #error AppVersion must be supplied by the Windows packaging pipeline
 #endif
-#define AppPublisher "Atelier"
-#define AppExeName "Atelier.exe"
+#ifndef PayloadInclude
+  #error PayloadInclude must be supplied by the Windows packaging pipeline
+#endif
+#ifndef AppGuid
+  #define AppGuid "2E25ABE9-E3D5-4ABA-9E50-725BA75185AF"
+#endif
+#ifndef AppGroup
+  #define AppGroup "Atelier"
+#endif
 
 [Setup]
-AppId={{2E25ABE9-E3D5-4ABA-9E50-725BA75185AF}
-AppName={#AppName}
+AppId={code:ApplicationIdentity}
+AppName=Atelier
 AppVersion={#AppVersion}
-AppPublisher={#AppPublisher}
-DefaultDirName={localappdata}\{#AppName}
-DefaultGroupName={#AppName}
+AppVerName=Atelier {#AppVersion}
+VersionInfoVersion={#AppVersion}
+AppPublisher=Atelier
+AppPublisherURL=https://github.com/clownfetus/Atelier
+DefaultDirName={localappdata}\Atelier
+DefaultGroupName={code:ApplicationGroup}
 DisableProgramGroupPage=yes
-OutputDir=dist
+UsePreviousLanguage=no
 OutputBaseFilename=AtelierSetup
-Compression=lzma2
+Compression=lzma2/fast
 SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=lowest
+ArchitecturesAllowed=x64compatible
+; Retain upstream's 32-bit installer registration view for upgrade discovery.
+; The application payload is x64; install mode does not change executable bitness.
+MinVersion=10.0
 CloseApplications=yes
-UninstallDisplayIcon={app}\{#AppExeName}
+RestartApplications=no
+SetupMutex=AtelierPackagingSetup
+UninstallDisplayIcon={app}\Atelier.exe
+UninstallDisplayName=Atelier
+LicenseFile=LICENSE
+SetupIconFile=icon.ico
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -28,53 +47,87 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
 
-; Every source is listed by name -- never "dist\Atelier\*". Running dist\Atelier\Atelier.exe to test
-; a build writes assets\, _cache\ and mr_config.json beside it, and a wildcard would ship them.
-; Tools entries mirror scripts/stage_tools.py's Windows manifest (tests/test_packaging.py checks
-; both stay in sync). None carries skipifsourcedoesntexist on purpose: a missing tool fails the
-; compile instead of producing an installer without UAssetTool (TRIAGE #39).
-; Mappings and AES_KEY.txt are game-derived and never ship; the app fetches both on first run.
 [Files]
-Source: "dist\Atelier\{#AppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "dist\Atelier\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "dist\Atelier\Tools\UAssetTool.exe"; DestDir: "{app}\Tools"; Flags: ignoreversion
-Source: "dist\Atelier\Tools\UAssetGUI.exe"; DestDir: "{app}\Tools"; Flags: ignoreversion
-Source: "dist\Atelier\Tools\AtelierMesh\*"; DestDir: "{app}\Tools\AtelierMesh"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "dist\Atelier\Tools\shaders\retoc-rivals-cli.exe"; DestDir: "{app}\Tools\shaders"; Flags: ignoreversion
-Source: "dist\Atelier\Tools\shaders\oo2core_9_win64.dll"; DestDir: "{app}\Tools\shaders"; Flags: ignoreversion
-Source: "dist\Atelier\Tools\shaders\dxc.exe"; DestDir: "{app}\Tools\shaders"; Flags: ignoreversion
-Source: "dist\Atelier\Tools\shaders\dxcompiler.dll"; DestDir: "{app}\Tools\shaders"; Flags: ignoreversion
-Source: "dist\Atelier\Tools\shaders\dxil.dll"; DestDir: "{app}\Tools\shaders"; Flags: ignoreversion
-; A seed only: browse._fetch_char_data writes fetched IDs back into it, so never overwrite.
-Source: "dist\Atelier\Tools\MarvelRivalsCharacterIDs.md"; DestDir: "{app}\Tools"; Flags: onlyifdoesntexist uninsneveruninstall
+; No wildcard over dist or Tools. Exactly the same files as the validated portable payload.
+#include PayloadInclude
 
-; User data lives beside the exe. These are never installed, never deleted by an upgrade, and
-; uninsneveruninstall keeps even an uninstall from removing them.
 [Dirs]
 Name: "{app}\assets\projects"; Flags: uninsneveruninstall
 Name: "{app}\assets\exported"; Flags: uninsneveruninstall
 
 [Icons]
-Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"
-Name: "{userdesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
+Name: "{group}\Atelier"; Filename: "{app}\Atelier.exe"; WorkingDir: "{app}"
+Name: "{userdesktop}\{code:ApplicationGroup}"; Filename: "{app}\Atelier.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
-; Clear stale payload so a removed/renamed .pyd/.dll from an older build can't shadow the new
-; one. [Files] uses ignoreversion, which overwrites everything that still ships but never removes
-; what no longer does -- that gap is what this closes.
-;
-; THE RULE: only list a folder the installer owns outright and the app never writes to. NEVER
-; "{app}", "{app}\Tools" or anything under assets\ -- user data lives in {app} (assets\projects,
-; assets\exported, _cache, mr_config.json, Tools\Mappings, Tools\AES_KEY.txt) and a wipe of a
-; parent deletes every project the user has ever made. tests/test_packaging.py enforces this list.
-;   _internal                 PyInstaller output, read-only at runtime
-;   Tools\AtelierMesh         vendor drop, shipped whole
-;   Tools\retoc-rivals-cli    retired layout; nothing reads it any more
-; Tools\shaders is NOT wiped: its files are overwritten by name above, and wiping the folder would
-; also take anything a user put there. Mappings must never be listed: nothing ships into it.
 [InstallDelete]
+; The immutable PyInstaller runtime is owned by the installer. Removed Python/native modules
+; must not survive an upgrade. No parent of projects, preferences or external tools is removed.
 Type: filesandordirs; Name: "{app}\_internal"
-Type: filesandordirs; Name: "{app}\Tools\AtelierMesh"
-Type: filesandordirs; Name: "{app}\Tools\retoc-rivals-cli"
 
 [Run]
-Filename: "{app}\{#AppExeName}"; Description: "Launch {#AppName}"; Flags: nowait postinstall
+Filename: "{app}\Atelier.exe"; Description: "Launch Atelier"; Flags: nowait postinstall skipifsilent
+
+[Code]
+function PackagingTestIdentity: String;
+var
+  I: Integer;
+begin
+  Result := Lowercase(ExpandConstant('{param:PACKAGINGTESTID|@none}'));
+  if Result = '@none' then begin
+    Result := '';
+    Exit;
+  end;
+  if (Length(Result) <> 32) or (ExpandConstant('{param:DIR|}') = '') then
+    RaiseException('PACKAGINGTESTID requires a 32-character hexadecimal ID and an explicit /DIR.');
+  for I := 1 to Length(Result) do
+    if Pos(Result[I], '0123456789abcdef') = 0 then
+      RaiseException('Invalid PACKAGINGTESTID.');
+end;
+
+function ApplicationIdentity(Param: String): String;
+var
+  TestId: String;
+begin
+  TestId := PackagingTestIdentity;
+  if TestId = '' then Result := '{' + '{#AppGuid}' + '}'
+  else Result := 'AtelierPackagingTest-' + TestId;
+end;
+
+function ApplicationGroup(Param: String): String;
+var
+  TestId: String;
+begin
+  TestId := PackagingTestIdentity;
+  if TestId = '' then Result := '{#AppGroup}'
+  else Result := 'AtelierPackagingTest-' + TestId;
+end;
+
+function HasDotNet48: Boolean;
+var
+  Release: Cardinal;
+begin
+  Result := RegQueryDWordValue(HKLM32, 'SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full', 'Release', Release)
+            and (Release >= 528040);
+end;
+
+function HasWebView2: Boolean;
+var
+  Version: String;
+  Key: String;
+begin
+  Key := 'Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}';
+  Result := ((RegQueryStringValue(HKCU, Key, 'pv', Version) and (Version <> '') and (Version <> '0.0.0.0')) or
+             (RegQueryStringValue(HKLM32, Key, 'pv', Version) and (Version <> '') and (Version <> '0.0.0.0')) or
+             (RegQueryStringValue(HKLM64, Key, 'pv', Version) and (Version <> '') and (Version <> '0.0.0.0')));
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+  if not HasDotNet48 then begin
+    Result := '.NET Framework 4.8 or newer is required. Install it from https://dotnet.microsoft.com/download/dotnet-framework and run Setup again.';
+    Exit;
+  end;
+  if not HasWebView2 then
+    Result := 'Microsoft Edge WebView2 Runtime is required. Install the Evergreen Runtime from https://developer.microsoft.com/microsoft-edge/webview2/ and run Setup again. Your existing Atelier files have not been changed.';
+end;

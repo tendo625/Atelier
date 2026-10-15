@@ -89,10 +89,17 @@ This checks geometry rendering and resource disposal through three open/close cy
 
 ## Packaging
 
-For a clean committed source checkout, [PACKAGING.md](PACKAGING.md) describes the
-review-package script, matching source archive, file manifest, checksums and the
-actual frozen-executable smoke test. The direct PyInstaller command below remains
-available for local iteration.
+The unified Windows pipeline, bootstrap, portable/installer outputs and upgrade
+validation are documented in [PACKAGING.md](PACKAGING.md). For current work use
+`BUILD.bat --output-dir D:\AtelierBuilds\Windows --allow-dirty`; committing is not
+required. `requirements-build.txt` separates the pinned build toolchain from
+runtime requirements. Native tools stay external unless individually approved
+for redistribution. The phase evidence below describes earlier source baselines;
+use PACKAGING.md for the current release workflow.
+
+The direct PyInstaller command below remains available for local iteration only.
+It omits the installer, licence collection, source archive and release validation;
+use BUILD.bat for distributable builds.
 
 ```powershell
 .\.venv\Scripts\python.exe -m PyInstaller --noconfirm `

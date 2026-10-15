@@ -1,0 +1,82 @@
+name: Windows packaging validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version override (empty uses the version file)'
+        required: false
+        type: string
+  pull_request:
+    paths:
+      - 'Atelier.spec'
+      - 'Atelier.iss'
+      - 'BUILD.bat'
+      - 'version'
+      - 'io_lib.py'
+      - 'main.py'
+      - 'server.py'
+      - 'icon.ico'
+      - 'LICENSE'
+      - 'licenses/**'
+      - 'requirements*.txt'
+      - 'scripts/**'
+      - 'tests/**'
+      - 'atelier/**'
+      - 'window.py'
+      - 'gui/**'
+      - '.github/workflows/windows-packaging.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-package-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    env:
+      BUILD_OUTPUT: ${{ runner.temp }}\AtelierWindowsBuild
+      REQUESTED_VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.14'
+          architecture: x64
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Prepare pinned compiler and Python environment
+        shell: pwsh
+        run: |
+          ./scripts/bootstrap_windows.ps1 -Python (Get-Command python).Source -ToolchainDir "$env:RUNNER_TEMP\AtelierToolchain" -InstallWebView2
+          "ISCC=$env:ISCC" >> $env:GITHUB_ENV
+      - name: Build and validate portable and installer packages
+        shell: pwsh
+        run: |
+          $buildArgs = @('--output-dir', $env:BUILD_OUTPUT)
+          if ($env:REQUESTED_VERSION) { $buildArgs += @('--version', $env:REQUESTED_VERSION) }
+          & ./.venv-build/Scripts/python.exe scripts/package_release.py @buildArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload validated artefacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Atelier-Windows-${{ github.sha }}
+          path: ${{ env.BUILD_OUTPUT }}\releases\**
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload diagnostic reports even after failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Atelier-Windows-logs-${{ github.run_id }}
+          path: ${{ env.BUILD_OUTPUT }}\diagnostics\*.zip
+          if-no-files-found: warn
+          retention-days: 14

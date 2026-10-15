@@ -7,7 +7,6 @@ import os
 import datetime
 if sys.platform.startswith("linux") and os.environ.get("WAYLAND_DISPLAY"):
     os.environ.setdefault("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
-import webview
 
 from atelier import hostos
 from atelier.web.app import PORT
@@ -83,6 +82,23 @@ def main():
     _show_launch_toast()
     _setup_logging()
 
+    from atelier.windows_runtime import launch_issue
+    issue = launch_issue()
+    if issue:
+        print(issue, file=sys.stderr)
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(None, issue, "Atelier - missing runtime", 0x10)
+        return 1
+    try:
+        import webview
+    except Exception as error:
+        message = f"Atelier could not load its desktop runtime: {error}. See the _logs directory and PACKAGING.md in the source archive."
+        print(message, file=sys.stderr)
+        if os.name == "nt":
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, message, "Atelier - launch failed", 0x10)
+        return 1
+
     t = threading.Thread(target=_run_server, daemon=True)
     t.start()
 
@@ -103,10 +119,10 @@ def main():
     # Linux means no localStorage at all — touching it throws and kills app.js before init().
     # A persistent store also keeps the Settings toggles across launches, which is what the UI
     # already assumes when it reads them back.
-    webview.start(_focus, debug=_debug, private_mode=False,
+    webview.start(_focus, gui="edgechromium" if os.name == "nt" else None, debug=_debug, private_mode=False,
                   storage_path=os.path.join(_DATA_ROOT, "_webview"))
     os._exit(0)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

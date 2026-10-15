@@ -1,190 +1,251 @@
-"""Build an auditable Windows review package from a clean, committed checkout.
+"""Build, test and package one Windows payload as portable ZIP and per-user installer."""
+from __future__ import annotations
 
-Run with the development virtual environment. Native modding tools and user data
-are never copied. Output must live outside the source checkout. This produces a
-portable onedir ZIP, a matching Git source ZIP, runtime licenses and SHA-256 sums;
-it does not run an installer or publish a release.
-"""
 import argparse
-import hashlib
-import importlib.metadata
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import shutil
 import subprocess
 import sys
-import zipfile
+import uuid
+
+from windows_package import (BuildError, approved_tools, audit_bundle, discover_iscc,
+    file_records, git, inventory_digest, sha256, snapshot_source, source_inventory,
+    stage_approved_tools, validate_dependencies, verify_resources, write_installer_files,
+    write_json, zip_tree, zip_logs, verify_snapshot, verify_payload, verify_source_zip,
+    extract_verified_portable, source_identity)
+from runtime_licenses import collect_licenses
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def git(*args):
-    return subprocess.check_output(['git', *args], cwd=ROOT, text=True).strip()
+def run(command, cwd, log, env=None, timeout=1800):
+    log.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Running {Path(str(command[0])).name}: {log.name}", flush=True)
+    with log.open("w", encoding="utf-8") as stream:
+        stream.write(subprocess.list2cmdline([str(c) for c in command]) + "\n")
+        stream.flush()
+        try:
+            result = subprocess.run([str(c) for c in command], cwd=cwd, env=env,
+                                    stdout=stream, stderr=subprocess.STDOUT, timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            raise BuildError(f"Command timed out; see {log}") from error
+    if result.returncode:
+        raise BuildError(f"Command failed with exit code {result.returncode}; see {log}")
 
 
-def sha256(path):
-    with path.open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+def preflight(args):
+    if sys.platform != "win32" or platform.machine().lower() not in {"amd64", "x86_64"} or sys.maxsize <= 2**32:
+        raise BuildError("Build with Windows x64 Python 3.12.")
+    if sys.version_info[:2] != (3, 12):
+        raise BuildError("Python 3.12 is required. Run scripts/bootstrap_windows.ps1 -Python PATH.")
+    versions = validate_dependencies(ROOT)
+    iscc = discover_iscc(args.iscc)
+    if not shutil.which("node") or ((ROOT / '.git').exists() and not shutil.which('git')):
+        raise BuildError("Node.js is required for regression tests; a Git checkout also needs Git on PATH.")
+    from atelier_runtime_check import launch_issue
+    issue = launch_issue()
+    if issue:
+        raise BuildError(issue)
+    if args.tools_dir and not args.native_policy:
+        raise BuildError("--tools-dir requires --native-policy; unreviewed binaries are never bundled.")
+    native = approved_tools(args.native_policy, args.tools_dir)
+    print("Native tools: " + (f"{len(native)} explicitly approved files" if native else "external; missing-tool warnings enabled"))
+    return versions, iscc, native
 
 
-def collect_licenses(destination):
-    records = []
-    packages = set()
-    for line in (ROOT / 'requirements.txt').read_text(encoding='utf-8').splitlines():
-        match = re.match(r'([A-Za-z0-9_-]+)==', line)
-        if match:
-            packages.add(match[1])
-    # Included by PyInstaller's runtime hooks, rather than imported directly by Atelier.
-    packages.update(('setuptools', 'pyinstaller'))
-    for package in sorted(packages):
-        dist = importlib.metadata.distribution(package)
-        copied = []
-        for entry in dist.files or []:
-            if not any(part.lower().startswith(('license', 'copying', 'notice')) for part in entry.parts):
-                continue
-            source = Path(dist.locate_file(entry))
-            if not source.is_file():
-                continue
-            # Distribution RECORD paths may traverse to Scripts; keep only safe basenames
-            # under their distribution-relative directory, never write outside this tree.
-            parts = [part for part in entry.parts if part not in ('..', '.', '')]
-            target = destination / f'{package}-{dist.version}' / Path(*parts)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, target)
-            copied.append(target.relative_to(destination).as_posix())
-        supplemental = ROOT / 'licenses' / package
-        if supplemental.is_dir():
-            for source in supplemental.iterdir():
-                if source.is_file():
-                    target = destination / f'{package}-{dist.version}' / source.name
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(source, target)
-                    copied.append(target.relative_to(destination).as_posix())
-        records.append({'name': package, 'version': dist.version,
-                        'license': dist.metadata.get('License-Expression') or dist.metadata.get('License', ''),
-                        'files': copied})
-    python_license = Path(sys.base_prefix) / 'LICENSE.txt'
-    if not python_license.is_file():
-        raise RuntimeError(f'Python license missing: {python_license}')
-    shutil.copy2(python_license, destination / 'PYTHON-LICENSE.txt')
-    (destination / 'runtime-packages.json').write_text(json.dumps(records, indent=2), encoding='utf-8')
-    missing = [record['name'] for record in records if not record['files']]
-    if missing:
-        raise RuntimeError('Installed wheels lack license files: ' + ', '.join(missing))
-    return records
-
-
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--output-dir', type=Path, required=True)
-    args = parser.parse_args()
-    if os.name != 'nt' or sys.maxsize <= 2**32:
-        raise SystemExit('Build this package with 64-bit Python on Windows.')
+    parser.add_argument("--output-dir", required=True, type=Path, help="Outside the checkout; contains work/, reports/ and releases/.")
+    parser.add_argument("--version", help="N.N.N[.N], each component 0..65535; defaults to version file.")
+    parser.add_argument("--iscc", type=Path)
+    parser.add_argument("--allow-dirty", action="store_true", help="Build an explicitly labelled working-tree source snapshot.")
+    parser.add_argument("--tools-dir", type=Path)
+    parser.add_argument("--native-policy", type=Path, help="Per-file hashes, licence texts and redistribution permission.")
+    parser.add_argument("--previous-install-dir", type=Path, help="Test an upgrade from an existing installed EXE/runtime, copied read-only into isolation.")
+    parser.add_argument("--preflight", action="store_true", help="Validate toolchain and native policy without building.")
+    parser.add_argument("--clean", action="store_true", help="After success, remove only this run's owned work directory.")
+    args = parser.parse_args(argv)
     output = args.output_dir.resolve()
-    if output == ROOT or ROOT in output.parents:
-        raise SystemExit('Choose an output directory outside the source checkout.')
-    if git('status', '--porcelain', '--untracked-files=all'):
-        raise SystemExit('Commit or exclude local files first; the release requires a clean checkout.')
-    commit = git('rev-parse', 'HEAD')
-    short = commit[:12]
-    work = output / 'build' / short
-    dist = work / 'dist'
-    report = output / f'package-{short}'
+    if output == ROOT or output.is_relative_to(ROOT):
+        parser.error("--output-dir must be outside the source checkout.")
+    output.mkdir(parents=True, exist_ok=True)
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
+    report = output / "reports" / run_id
     report.mkdir(parents=True, exist_ok=False)
-    command = [sys.executable, '-m', 'PyInstaller', '--noconfirm', '--clean',
-               '--distpath', str(dist), '--workpath', str(work / 'work'), 'Atelier.spec']
-    with (report / 'build.log').open('w', encoding='utf-8') as log:
-        subprocess.run(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, check=True)
-    bundle = dist / 'Atelier'
-    forbidden_dirs = {'tools', 'assets', '_cache', '_logs', '_webview', '.git', '.venv', '__pycache__'}
-    forbidden_files = {'mr_config.json', 'aes_key.txt', '.env', '.mcp.json'}
-    forbidden_extensions = {'.usmap', '.uasset', '.uexp', '.ubulk', '.pak', '.ucas', '.utoc', '.blend'}
-    for path in bundle.rglob('*'):
-        rel = path.relative_to(bundle)
-        # Python's stdlib and dependencies legitimately include __pycache__ folders;
-        # source caches must never be collected from GUI or Blender script directories.
-        parts = {part.lower() for part in rel.parts}
-        denied = (parts & (forbidden_dirs - {'__pycache__'})) or path.name.lower() in forbidden_files
-        source_cache = '__pycache__' in parts and ('gui' in parts or 'atelier' in parts)
-        if denied or source_cache or path.suffix.lower() in forbidden_extensions:
-            raise RuntimeError(f'Unexpected local/game data in bundle: {rel}')
-    for source in (ROOT / 'gui').rglob('*'):
-        if source.is_file():
-            target = bundle / '_internal' / 'gui' / source.relative_to(ROOT / 'gui')
-            if not target.is_file() or sha256(source) != sha256(target):
-                raise RuntimeError(f'GUI asset missing or stale: {source.relative_to(ROOT)}')
-    for source in (ROOT / 'atelier' / 'blender').rglob('*.py'):
-        target = bundle / '_internal' / source.relative_to(ROOT)
-        if not target.is_file() or sha256(source) != sha256(target):
-            raise RuntimeError(f'Blender script missing or stale: {source.relative_to(ROOT)}')
-    shutil.copy2(ROOT / 'LICENSE', bundle / 'LICENSE')
-    licenses = bundle / 'licenses'
-    licenses.mkdir()
-    runtime_packages = collect_licenses(licenses)
-    source_name = f'Atelier-Studio-source-{short}.zip'
-    archive_name = f'Atelier-Studio-Windows-x64-{short}.zip'
-    readme = f'''Atelier Studio modernization - Windows review build
+    status = {"status": "failed", "run_id": run_id, "checks": [], "release": None}
+    work = output / "work" / run_id
+    try:
+        version = args.version or (ROOT / "version").read_text(encoding="utf-8").strip()
+        if not re.fullmatch(r"(?:0|[1-9]\d{0,4})(?:\.(?:0|[1-9]\d{0,4})){2,3}", version) or any(int(p) > 65535 for p in version.split(".")):
+            raise BuildError("Version must be N.N.N[.N], each component 0..65535 (no leading zeros).")
+        versions, iscc, native = preflight(args)
+        run([sys.executable, "-m", "pip", "check"], ROOT, report / "pip-check.log")
+        compiler_pin = json.loads((ROOT / "scripts/windows_toolchain.json").read_text())["inno_setup"]
+        compiler_hashes = {}
+        for filename, expected in compiler_pin["files"].items():
+            file = iscc.parent / filename
+            if not file.is_file() or sha256(file) != expected:
+                raise BuildError(f"Compiler {filename} does not match pinned Inno Setup 6.7.3; run scripts/bootstrap_windows.ps1.")
+            compiler_hashes[filename] = expected
+        write_json(report / "inno-toolchain.json", {"version": compiler_pin["version"], "files": compiler_hashes})
+        if args.preflight:
+            status.update(status="preflight-passed", dependencies=versions, iscc=str(iscc))
+            return 0
+        commit, dirty, origin = source_identity(ROOT)
+        if dirty and not args.allow_dirty:
+            raise BuildError("Source has uncommitted changes. Use --allow-dirty for an auditable working-tree build; no commit is necessary.")
+        inventory, excluded = source_inventory(ROOT)
+        source_digest = inventory_digest(inventory)
+        info = {"base_commit": commit, "working_tree": dirty, "input_source_sha256": source_digest,
+                "application_version": version, "built_utc": datetime.now(timezone.utc).isoformat(),
+                "python": sys.version, "dependencies": versions, "platform": "windows-x64",
+                "inno_setup": compiler_pin['version'], "native_tools_included": bool(native), "official_release": False,
+                "excluded_source_paths": excluded, "source_origin": origin}
+        work.mkdir(parents=True, exist_ok=False)
+        write_json(work / ".atelier-build-workspace.json", {"run_id": run_id, "source": str(ROOT)})
+        source = work / "source"
+        snapshot_source(ROOT, source, inventory, version)
+        write_json(source / "BUILD_INFO.json", info)
+        snapshot_records = file_records(source)
+        write_json(source / "SOURCE_MANIFEST.json", snapshot_records)
+        env = dict(os.environ, PYTHONUTF8="1", PYTHONDONTWRITEBYTECODE="1", PYTHONNOUSERSITE='1',
+                   PYINSTALLER_CONFIG_DIR=str(work / 'pyinstaller-cache'))
+        for key in ("MR_TOOLS", "ATELIER_DATA_DIR", "ATELIER_PORT", "ATELIER_BUILD_VERSION_FILE", "ATELIER_PE_VERSION_FILE", 'PYTHONPATH', 'PYTHONHOME'):
+            env.pop(key, None)
+        # Tests run on the immutable snapshot, never the installed app or live projects.
+        run([sys.executable, "tests/run_checks.py", "--report-dir", report / "regression"], source,
+            report / "regression.log", env=env)
+        status["checks"].append("isolated regression suites")
+        from PyInstaller.utils.win32.versioninfo import (VSVersionInfo, FixedFileInfo, StringFileInfo,
+                                                         StringTable, StringStruct, VarFileInfo, VarStruct)
+        numeric_version = tuple(int(p) for p in version.split("."))
+        numeric_version += (0,) * (4 - len(numeric_version))
+        pe = VSVersionInfo(ffi=FixedFileInfo(filevers=numeric_version, prodvers=numeric_version, fileType=1), kids=[
+            StringFileInfo([StringTable("040904B0", [StringStruct(k, v) for k, v in {
+                "CompanyName": "Atelier", "FileDescription": "Atelier", "FileVersion": version,
+                "ProductName": "Atelier", "ProductVersion": version, "OriginalFilename": "Atelier.exe"}.items()])]),
+            VarFileInfo([VarStruct("Translation", [1033, 1200])])])
+        pe_path = work / "pe-version.txt"
+        pe_path.write_text(str(pe), encoding="utf-8")
+        env["ATELIER_PE_VERSION_FILE"] = str(pe_path)
+        run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--distpath", work / "dist",
+             "--workpath", work / "pyinstaller", "Atelier.spec"], source, report / "pyinstaller.log", env=env)
+        bundle = work / "dist" / "Atelier"
+        shutil.copy2(source / "LICENSE", bundle / "LICENSE")
+        shutil.copy2(source / "BUILD_INFO.json", bundle / "BUILD_INFO.json")
+        packages = collect_licenses(source, bundle / "licenses")
+        stage_approved_tools(native, args.tools_dir, bundle)
+        write_json(bundle / "NATIVE_TOOLS.json", {"mode": "approved-files" if native else "external", "files": native})
+        (bundle / "README.txt").write_text(
+            f"Atelier {version} - Windows x64 contributor build\n"
+            f"Base commit: {commit}\nWorking-tree snapshot: {dirty}\nSource digest: {source_digest}\n\n"
+            "Extract the entire ZIP into a new writable folder; keep Atelier.exe beside _internal.\n"
+            "Python is included. Windows 10/11 x64, .NET Framework 4.8 and Microsoft Edge WebView2 Runtime are required.\n"
+            "WebView2: https://developer.microsoft.com/microsoft-edge/webview2/\n"
+            "Native modding tools are external unless listed in NATIVE_TOOLS.json. Obtain compatible licensed\n"
+            "UAssetTool, UAssetGUI, AtelierMesh, custom shader retoc/Oodle and DXC before using their features.\n"
+            "Use Setup/Settings for game paths. Missing tools are reported on first run; see PACKAGING.md\n"
+            "in the matching source archive for paths, provenance and licence policy. AES keys, mappings,\n"
+            "projects and game files are never included. Data stays beside the executable by default.\n"
+            "For isolated testing set ATELIER_DATA_DIR to a new directory and ATELIER_PORT to a free port.\n"
+            "Installer upgrades and uninstall preserve user work. Never extract over an old portable runtime;\n"
+            "use a fresh directory and point ATELIER_DATA_DIR at the existing data directory instead.\n"
+            "Keep the matching source archive, licence texts, manifest and checksums with this unsigned build.\n",
+            encoding="utf-8")
+        audit_bundle(bundle)
+        checks = verify_resources(source, bundle)
+        status["checks"].append(f"{len(checks)} GUI, Blender and frozen Python source comparisons")
+        manifest = {"build": info, "runtime_packages": packages, "files": file_records(bundle)}
+        write_json(bundle / "MANIFEST.json", manifest)
+        write_json(report / "MANIFEST.json", manifest)
+        run([sys.executable, "tests/frozen_smoke.py", "--exe", bundle / "Atelier.exe",
+             "--report-dir", report / "frozen"], source, report / "frozen.log", env=env, timeout=240)
+        status["checks"].append("frozen executable and WebView2")
+        verify_payload(bundle, manifest)
+        payload_include = work / "payload.iss"
+        write_installer_files(bundle, payload_include)
+        candidate = work / "candidate"
+        candidate.mkdir()
+        name = f"Atelier-{version}-Windows-x64-{source_digest[:12]}" + ("-working-tree" if dirty else "")
+        run([iscc, f"/DAppVersion={version}", f"/DPayloadInclude={payload_include}", f"/O{candidate}",
+             f"/F{name}-Setup", source / "Atelier.iss"], source, report / "inno-build.log", env=env)
+        installer = candidate / f"{name}-Setup.exe"
+        install_command = [sys.executable, "tests/installer_smoke.py", "--installer", installer,
+                           "--bundle", bundle, "--report-dir", report / "installer", "--iscc", iscc]
+        if args.previous_install_dir:
+            install_command += ["--previous-install-dir", args.previous_install_dir.resolve(strict=True)]
+        run(install_command, source, report / "installer.log", env=env, timeout=900)
+        status["checks"].append("installer install/upgrade/uninstall with preserved user-data hashes")
+        current, _ = source_inventory(ROOT)
+        if current != inventory or source_identity(ROOT)[0] != commit:
+            raise BuildError("Source changed during build. No release was emitted; run again.")
+        verify_snapshot(source, snapshot_records)
+        verify_payload(bundle, manifest)
+        portable_zip = candidate / f"{name}-Portable.zip"
+        source_zip = candidate / f"{name}-Source.zip"
+        zip_tree(bundle, portable_zip, "Atelier/")
+        extracted = extract_verified_portable(portable_zip, work / 'portable-extracted', manifest)
+        run([sys.executable, "tests/frozen_smoke.py", "--exe", extracted / 'Atelier.exe',
+             "--report-dir", report / 'portable-extracted'], source, report / 'portable-extracted.log', env=env, timeout=240)
+        verify_payload(extracted, manifest)
+        status['checks'].append('delivered portable ZIP exact inventory, hashes and extracted WebView2 launch')
+        zip_tree(source, source_zip, "Atelier-source/")
+        verify_source_zip(source_zip, snapshot_records)
+        status['checks'].append('matching source ZIP inventory and hashes')
+        # Check both input and snapshot again after all tests, before emitting a release.
+        if source_inventory(ROOT)[0] != inventory or source_identity(ROOT)[0] != commit:
+            raise BuildError('Source changed during final archive verification; no release was emitted.')
+        verify_snapshot(source, snapshot_records)
+        for relative in ('frozen/results.json', 'portable-extracted/results.json', 'installer/installed-frozen/results.json'):
+            check_result = json.loads((report / relative).read_text(encoding='utf-8'))
+            for warning in check_result.get('screenshot_warnings', []):
+                status.setdefault('diagnostic_warnings', []).append(f'{relative}: {warning}')
+        shutil.copy2(report / "MANIFEST.json", candidate / "MANIFEST.json")
+        write_json(candidate / "BUILD_INFO.json", info)
+        zip_logs(report, candidate / f"{name}-Logs.zip")
+        sums = "".join(f"{sha256(p)}  {p.name}\n" for p in sorted(candidate.iterdir()) if p.is_file())
+        (candidate / "SHA256SUMS.txt").write_text(sums, encoding="utf-8")
+        release = output / "releases" / (name + "-" + run_id)
+        release.parent.mkdir(parents=True, exist_ok=True)
+        completed_status = dict(status, status="passed", release=str(release), source=info)
+        write_json(candidate / "VALIDATION.json", completed_status)
+        # Cover validation as well, without a recursive checksum dependency.
+        with (candidate / "SHA256SUMS.txt").open("a", encoding="utf-8") as stream:
+            stream.write(f"{sha256(candidate / 'VALIDATION.json')}  VALIDATION.json\n")
+        # Candidate lives on the same volume. Consumers only see a completed, validated directory.
+        candidate.rename(release)
+        status.update(completed_status)
+        if args.clean:
+            marker = work / ".atelier-build-workspace.json"
+            try:
+                if work.parent.resolve() != (output / "work").resolve() or work.is_symlink() or work.is_junction() or json.loads(marker.read_text())["run_id"] != run_id:
+                    status["cleanup_warning"] = "Refused to clean an unowned work directory."
+                else:
+                    shutil.rmtree(work)
+            except (OSError, ValueError, KeyError) as error:
+                status["cleanup_warning"] = f"Validated release retained; work cleanup failed: {error}"
+        print(f"Validated release: {release}", flush=True)
+        return 0
+    except Exception as error:
+        status["error"] = str(error)
+        print(f"BUILD FAILED: {error}\nReports: {report}", file=sys.stderr, flush=True)
+        return 1
+    finally:
+        try:
+            write_json(report / "VALIDATION.json", status)
+            diagnostics = output / "diagnostics"
+            diagnostics.mkdir(exist_ok=True)
+            zip_logs(report, diagnostics / (run_id + ".zip"))
+        except OSError as error:
+            # A diagnostic write must not turn a completed release into a reported failed build,
+            # or mask the original validation failure. The release has its own validation record.
+            print(f'Diagnostic report could not be written: {error}', file=sys.stderr)
 
-Source commit: {commit}
-Base application version: {(ROOT / 'version').read_text().strip()}
-This is an unsigned review build of a contributor fork, not an official upstream release.
 
-Extract the whole ZIP into a new writable folder. Keep Atelier.exe beside _internal.
-Do not copy the EXE alone. Windows x64 and Microsoft Edge WebView2 are required.
-Do not run two Atelier instances on the same port or against the same data folder.
-
-Native modding tools (UAssetTool, AtelierMesh, retoc/Oodle, DXC and Blender), game
-files, AES keys and mappings are intentionally excluded. Configure external tools
-and game paths through Setup/Settings. Review DEVELOPMENT.md in the matching source
-archive for the verified tool installer and isolated-data setup. Preserve existing
-projects and back up the original installation before testing an upgrade.
-
-For isolated testing in PowerShell:
-  $env:ATELIER_DATA_DIR = 'D:\\AtelierReviewData'
-  $env:ATELIER_PORT = '8778'
-  .\\Atelier.exe
-Use a separate test-mods destination; this package does not install any mods.
-
-Atelier is licensed under the included LICENSE. GUI third-party licenses and
-provenance are under _internal/gui/vendor; Python runtime/package licenses are
-under licenses. The matching complete project source archive is {source_name}.
-Native export round trips and in-game checks remain separate from UI smoke tests.
-
-MANIFEST.json records source provenance and every packaged file's SHA-256 digest
-(excluding the manifest itself). External SHA256SUMS.txt covers both ZIPs.
-'''
-    (bundle / 'README.txt').write_text(readme, encoding='utf-8')
-    files = [{ 'path': path.relative_to(bundle).as_posix(), 'bytes': path.stat().st_size,
-               'sha256': sha256(path)} for path in sorted(bundle.rglob('*')) if path.is_file()]
-    manifest = {'source_commit': commit, 'application_version': (ROOT / 'version').read_text().strip(),
-                'python': sys.version.split()[0], 'pyinstaller': importlib.metadata.version('pyinstaller'),
-                'platform': 'windows-x64', 'native_tools_included': False,
-                'user_or_game_data_included': False, 'files': files,
-                'runtime_packages': [{k: p[k] for k in ('name', 'version')} for p in runtime_packages]}
-    (bundle / 'MANIFEST.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
-    # Guard against an edit made while PyInstaller was running.
-    if git('rev-parse', 'HEAD') != commit or git('status', '--porcelain', '--untracked-files=all'):
-        raise RuntimeError('Source changed during the build; do not distribute this build.')
-    subprocess.run(['git', 'archive', '--format=zip', '--prefix=Atelier-source/',
-                    '--output', str(output / source_name), commit], cwd=ROOT, check=True)
-    with zipfile.ZipFile(output / archive_name, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
-        for path in sorted(bundle.rglob('*')):
-            if path.is_file():
-                archive.write(path, 'Atelier/' + path.relative_to(bundle).as_posix())
-    for name in (archive_name, source_name):
-        with zipfile.ZipFile(output / name) as archive:
-            corrupt = archive.testzip()
-            if corrupt:
-                raise RuntimeError(f'Archive integrity check failed: {name}: {corrupt}')
-    sums = '\n'.join(f'{sha256(output / name)}  {name}' for name in (archive_name, source_name)) + '\n'
-    (output / 'SHA256SUMS.txt').write_text(sums, encoding='utf-8')
-    shutil.copy2(bundle / 'MANIFEST.json', report / 'MANIFEST.json')
-    print(json.dumps({'commit': commit, 'executable': str(bundle / 'Atelier.exe'),
-                      'windows_zip': str(output / archive_name), 'source_zip': str(output / source_name),
-                      'checksums': str(output / 'SHA256SUMS.txt'), 'files': len(files)}, indent=2))
-
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    raise SystemExit(main())

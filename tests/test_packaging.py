@@ -1,4 +1,4 @@
-"""Packaging invariants: the installer never deletes user data, and always ships the native tools.
+"""Packaging invariants: installer data safety and maintainer native-tool staging.
 
 Static checks over Atelier.iss and scripts/stage_tools.py, plus the staging script run against a
 fake Tools/ tree. No PyInstaller, Inno Setup or real tools needed.
@@ -14,6 +14,7 @@ from unittest.mock import Mock, patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import stage_tools as ST  # noqa: E402
+import windows_package as WP
 
 ISS = (ROOT / "Atelier.iss").read_text(encoding="utf-8")
 
@@ -43,6 +44,11 @@ class InstallerKeepsUserData(unittest.TestCase):
     def test_no_uninstall_delete(self):
         self.assertEqual(section("UninstallDelete"), [])
 
+    def test_original_installer_identity_and_registry_view_are_preserved(self):
+        self.assertIn('"2E25ABE9-E3D5-4ABA-9E50-725BA75185AF"', ISS)
+        self.assertNotRegex(ISS, r"(?m)^ArchitecturesInstallIn64BitMode=.+")
+        self.assertIn("PrivilegesRequired=lowest", ISS)
+
     def test_no_code_section_deletes_files(self):
         code = "\n".join(section("Code"))
         for call in ("DelTree", "DeleteFile", "RemoveDir"):
@@ -65,19 +71,31 @@ class InstallerKeepsUserData(unittest.TestCase):
                 self.assertNotRegex(dest.lower(), r"\\(assets|_cache|mappings)(\\|$)")
 
     def test_runtime_authored_seed_is_not_overwritten(self):
-        line = next(l for l in section("Files") if "MarvelRivalsCharacterIDs.md" in l)
-        self.assertIn("onlyifdoesntexist", line)
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp) / "bundle"
+            (bundle / "Tools").mkdir(parents=True)
+            (bundle / "Tools/MarvelRivalsCharacterIDs.md").write_text("seed")
+            include = Path(tmp) / "files.iss"
+            WP.write_installer_files(bundle, include)
+            self.assertIn("onlyifdoesntexist uninsneveruninstall", include.read_text(encoding="utf-8-sig"))
 
 
 class InstallerShipsTools(unittest.TestCase):
     def test_every_windows_manifest_entry_is_in_the_installer(self):
-        sources = {field(l, "Source") for l in section("Files")}
-        for rel, required in ST.MANIFEST["windows"]:
-            src = "dist\\Atelier\\Tools\\" + rel.replace("/", "\\")
-            parent = src.rsplit("\\", 1)[0] + "\\*"
-            with self.subTest(rel=rel):
-                self.assertTrue(src in sources or src + "\\*" in sources or parent in sources,
-                                f"{rel} is staged but not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp) / "bundle"
+            for rel, _ in ST.MANIFEST["windows"]:
+                path = bundle / "Tools" / rel
+                if Path(rel).suffix:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(b"tool")
+            include = Path(tmp) / "files.iss"
+            WP.write_installer_files(bundle, include)
+            sources = {field(line, "Source") for line in include.read_text(encoding="utf-8-sig").splitlines()}
+            for file in bundle.rglob("*"):
+                if file.is_file():
+                    self.assertIn(str(file), sources)
+            self.assertIn("#include PayloadInclude", ISS)
 
     def test_required_tools_cannot_be_silently_skipped(self):
         for line in section("Files"):

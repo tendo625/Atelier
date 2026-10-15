@@ -441,6 +441,8 @@ def check_prereqs(need_tool=True):
 
 def get_prereq_status():
     issues = _prereq_issues(need_tool=True)
+    from atelier.windows_runtime import native_tool_warnings
+    issues.extend(native_tool_warnings(TOOLS))
     # Containers that failed to read are reported here too. Never force a build — if the index
     # has not been built yet this is simply empty, and the browse path reports it instead.
     try:
